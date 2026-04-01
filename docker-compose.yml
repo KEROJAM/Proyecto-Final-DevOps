@@ -1,0 +1,138 @@
+# docker-compose.yml – Orquestación de servicios STF DevOps
+# Soluciones Tecnológicas del Futuro
+#
+# Servicios:
+#   - flask   → aplicación web Python (gunicorn)
+#   - nginx   → reverse proxy (puerto 80 público)
+#   - redis   → caché en memoria
+#
+# Redes personalizadas:
+#   - red-frontend  → nginx ↔ flask  (acceso externo)
+#   - red-backend   → flask ↔ redis  (interna, sin acceso externo)
+#
+# Volúmenes persistentes:
+#   - vol-logs      → logs de nginx y flask
+#   - vol-redis     → datos de redis (persisten al reiniciar)
+#
+# Uso:
+#   docker compose up -d          # levantar en segundo plano
+#   docker compose logs -f        # ver logs en tiempo real
+#   docker compose down           # detener y eliminar contenedores
+#   docker compose down -v        # detener y eliminar también los volúmenes
+
+services:
+
+  # ── FLASK (aplicación web) ──────────────────────────────────────────────────
+  flask:
+    build:
+      context: ./app          # directorio con el Dockerfile
+      dockerfile: Dockerfile
+    image: stf-flask:latest
+    container_name: stf-flask
+    restart: unless-stopped   # reinicia solo si falla, no si se detiene manualmente
+
+    environment:
+      - AMBIENTE=${AMBIENTE:-production}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+    volumes:
+      # Logs de la aplicación (persistentes en el host)
+      - vol-logs:/app/logs
+
+    networks:
+      - red-frontend            # se comunica con nginx
+      - red-backend             # se comunica con redis
+
+    depends_on:
+      redis:
+        condition: service_healthy  # espera a que redis esté listo
+
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── NGINX (reverse proxy) ───────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine    # imagen oficial mínima
+    container_name: stf-nginx
+    restart: unless-stopped
+
+    ports:
+      - "80:80"                 # único servicio expuesto al exterior
+
+    volumes:
+      # Configuración personalizada de nginx (montada desde el host)
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Logs de nginx (comparte volumen con flask para centralizar)
+      - vol-logs:/var/log/nginx
+
+    networks:
+      - red-frontend            # solo necesita hablar con flask, no con redis
+
+    depends_on:
+      flask:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1",
+             "--spider", "http://localhost/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── REDIS (caché en memoria) ────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine       # imagen oficial mínima
+    container_name: stf-redis
+    restart: unless-stopped
+
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+
+    volumes:
+      # Datos de redis persistentes (sobreviven a docker compose down)
+      - vol-redis:/data
+
+    networks:
+      - red-backend             # solo accesible internamente, nunca expuesto
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOLÚMENES PERSISTENTES
+# Gestionados por Docker; los datos sobreviven a reinicios de contenedores
+# ══════════════════════════════════════════════════════════════════════════════
+volumes:
+  vol-logs:
+    name: stf-vol-logs
+    driver: local               # almacenado en el host local
+
+  vol-redis:
+    name: stf-vol-redis
+    driver: local
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REDES PERSONALIZADAS
+# Aíslan la comunicación entre servicios (principio de mínimo privilegio)
+# ══════════════════════════════════════════════════════════════════════════════
+networks:
+  red-frontend:
+    name: stf-red-frontend
+    driver: bridge              # red bridge estándar de Docker
+
+  red-backend:
+    name: stf-red-backend
+    driver: bridge
+    internal: true              # sin acceso a internet (solo comunicación interna)
