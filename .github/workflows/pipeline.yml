@@ -94,5 +94,5 @@ jobs:
       - name: Verificar que la app responde tras el deploy
         run: |
           sleep 10
-          curl --fail http://${{ secrets.EC2_PUBLIC_IP }}/health \
+          curl --fail http://${{ secrets.EC2_PUBLIC_IP }} \
             || echo "Advertencia: health check falló, revisar EC2"
