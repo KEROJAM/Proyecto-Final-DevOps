@@ -1,0 +1,124 @@
+name: CI/CD Pipeline – STF DevOps
+# Equivalente al pipeline CodeBuild + CodePipeline
+# Se ejecuta automáticamente en cada push a main o develop
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 1: Pruebas automatizadas (equivalente a CodeBuild pre_build)
+  # ══════════════════════════════════════════════════════════════════════════
+  pruebas:
+    name: Pruebas Automatizadas
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          pip install --quiet -r app/requirements.txt
+          pip install --quiet pytest
+
+      - name: Ejecutar pruebas con pytest
+        run: pytest tests/ --tb=short --quiet
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 2: Build de imagen Docker (equivalente a CodeBuild build)
+  # ══════════════════════════════════════════════════════════════════════════
+  build:
+    name: Build Docker
+    runs-on: ubuntu-latest
+    needs: pruebas          # solo corre si las pruebas pasan
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Construir imagen Docker (multi-stage)
+        run: docker build -t stf-flask:latest ./app
+
+      - name: Verificar que la imagen arranca correctamente
+        run: |
+          docker run -d --name test-flask -p 5000:5000 stf-flask:latest
+          sleep 5
+          curl --fail http://localhost:5000/health || (docker logs test-flask && exit 1)
+          docker stop test-flask
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 3: Despliegue en EC2 via SSM (equivalente a CodeBuild post_build)
+  # Solo corre en push a main (no en PRs ni en develop)
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: Despliegue en EC2
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            us-east-1
+
+      - name: Empaquetar artefacto
+        run: zip -r artefacto.zip app/ nginx/ docker-compose.yml .env
+
+      - name: Subir artefacto a S3
+        run: |
+          aws s3 cp artefacto.zip \
+            s3://${{ secrets.BUCKET_ARTEFACTOS }}/artefacto.zip
+
+      - name: Guardar build exitoso en SSM
+        run: |
+          aws ssm put-parameter \
+            --name "/stf/ultimo-build-exitoso" \
+            --value "${{ github.sha }}" \
+            --type String \
+            --overwrite
+
+      - name: Desplegar en EC2 via SSM Session Manager
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "cd /home/ubuntu/stf-app",
+              "aws s3 cp s3://${{ secrets.BUCKET_ARTEFACTOS }}/artefacto.zip .",
+              "unzip -o artefacto.zip",
+              "docker compose down",
+              "docker compose up -d --build",
+              "echo Deploy OK: $(date)"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          # Esperar a que el comando termine en EC2
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+
+          echo "Despliegue completado. Command ID: $COMMAND_ID"
+
+      - name: Verificar que la app responde tras el deploy
+        run: |
+          sleep 10
+          curl --fail http://${{ secrets.EC2_PUBLIC_IP }}/health \
+            || echo "Advertencia: health check falló, revisar EC2"
