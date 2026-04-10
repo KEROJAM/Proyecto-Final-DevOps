@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Soluciones Tecnológicas del Futuro – Plataforma DevOps
+  Infraestructura: EC2 (Ubuntu) + S3 + Security Group
+  Restricciones Learner Lab:
+    - No se crean roles IAM ni grupos (usa LabRole preexistente)
+    - Instancias limitadas a tipos nano/micro/small/medium/large
+    - Máximo 9 instancias activas en total
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARÁMETROS  (el usuario los ingresa al hacer deploy)
+# ══════════════════════════════════════════════════════════════════════════════
+Parameters:
+
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >
+      AMI ID para las instancias EC2.
+      Cómo obtenerla: Consola AWS → EC2 → Launch Instance →
+      Application and OS Images → copiar el valor ami-xxxxxxxxxxxxxxxxx
+    ConstraintDescription: Debe ser una AMI ID válida (ami-xxxxxxxxxxxxxxxxx)
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: Tipo de instancia EC2 (solo tamaños permitidos en Learner Lab)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: vockey
+    Description: Nombre del par de claves para acceso SSH (usar "vockey" en Learner Lab)
+
+  NombreProyecto:
+    Type: String
+    Default: STF-DevOps
+    Description: Nombre del proyecto (se usa como prefijo en los tags)
+    MaxLength: 20
+    AllowedPattern: "[a-zA-Z0-9-]+"
+    ConstraintDescription: Solo letras, números y guiones
+
+  BucketSufijo:
+    Type: String
+    Description: >
+      Sufijo único para el nombre del bucket S3 (los nombres S3 son globales).
+      Ejemplo: mi-empresa-2024  →  stf-devops-mi-empresa-2024
+    AllowedPattern: "[a-z0-9-]+"
+    ConstraintDescription: Solo minúsculas, números y guiones
+
+  AmbienteDespliegue:
+    Type: String
+    Default: staging
+    AllowedValues:
+      - staging
+      - production
+    Description: Ambiente de despliegue (afecta los tags de los recursos)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RECURSOS
+# ══════════════════════════════════════════════════════════════════════════════
+Resources:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SECURITY GROUP
+  # Permite SSH (22) y HTTP (80) hacia la instancia EC2
+  # ────────────────────────────────────────────────────────────────────────────
+  SecurityGroupWeb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${NombreProyecto}-sg-web"
+      GroupDescription: Permite SSH y HTTP para instancias del proyecto
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS
+      Tags:
+        - Key: Name
+          Value: !Sub "${NombreProyecto}-sg-web"
+        - Key: Proyecto
+          Value: !Ref NombreProyecto
+        - Key: Ambiente
+          Value: !Ref AmbienteDespliegue
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # INSTANCIA EC2 – Servidor web principal
+  # Usa LabInstanceProfile (que referencia el LabRole preexistente)
+  # NO se crea un rol IAM nuevo (Learner Lab no lo permite)
+  # ────────────────────────────────────────────────────────────────────────────
+  InstanciaWebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroups:
+        - !Ref SecurityGroupWeb
+
+      # LabInstanceProfile es el perfil preexistente en Learner Lab
+      # que ya tiene asociado el LabRole con permisos de AWS
+      IamInstanceProfile: LabInstanceProfile
+
+      # Script de inicialización automática al lanzar la instancia
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          LOG="/var/log/userdata.log"
+          echo "=== Inicio UserData: $(date) ===" >> "$LOG"
+
+          # Actualizar sistema
+          apt-get update -qq >> "$LOG" 2>&1
+          apt-get upgrade -y -qq >> "$LOG" 2>&1
+
+          # Instalar dependencias previas a Docker
+          apt-get install -y curl gnupg ca-certificates git python3 python3-pip >> "$LOG" 2>&1
+
+          # Instalar Docker desde repositorio oficial
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+            | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          chmod a+r /etc/apt/keyrings/docker.gpg
+
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+            https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+            | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+          apt-get update -qq >> "$LOG" 2>&1
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG" 2>&1
+
+          # Agregar usuario ubuntu al grupo docker
+          usermod -aG docker ubuntu
+
+          # Habilitar Docker al inicio
+          systemctl enable docker
+          systemctl start docker
+
+          # Instalar boto3
+          pip3 install boto3 --quiet >> "$LOG" 2>&1
+
+          echo "=== UserData completado: $(date) ===" >> "$LOG"
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${NombreProyecto}-web-server"
+        - Key: Proyecto
+          Value: !Ref NombreProyecto
+        - Key: Ambiente
+          Value: !Ref AmbienteDespliegue
+        - Key: Rol
+          Value: WebServer
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # IP ELÁSTICA – para que la IP del servidor no cambie al reiniciar
+  # ────────────────────────────────────────────────────────────────────────────
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref InstanciaWebServer
+      Tags:
+        - Key: Name
+          Value: !Sub "${NombreProyecto}-eip"
+        - Key: Proyecto
+          Value: !Ref NombreProyecto
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # BUCKET S3 – Almacenamiento de artefactos y reportes
+  # ────────────────────────────────────────────────────────────────────────────
+  BucketArtefactos:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "stf-devops-${BucketSufijo}"
+
+      # Bloquear todo acceso público (buenas prácticas de seguridad)
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Versionado para mantener historial de artefactos
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Política de ciclo de vida: limpiar versiones antiguas automáticamente
+      LifecycleConfiguration:
+        Rules:
+          - Id: LimpiarVersionesAntiguas
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+      Tags:
+        - Key: Name
+          Value: !Sub "stf-devops-${BucketSufijo}"
+        - Key: Proyecto
+          Value: !Ref NombreProyecto
+        - Key: Ambiente
+          Value: !Ref AmbienteDespliegue
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # BUCKET S3 – Logs de acceso y auditoría
+  # ────────────────────────────────────────────────────────────────────────────
+  BucketLogs:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "stf-devops-logs-${BucketSufijo}"
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Expirar logs después de 90 días
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpirarLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+      Tags:
+        - Key: Name
+          Value: !Sub "stf-devops-logs-${BucketSufijo}"
+        - Key: Proyecto
+          Value: !Ref NombreProyecto
+        - Key: Ambiente
+          Value: !Ref AmbienteDespliegue
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OUTPUTS  (valores útiles tras el deploy)
+# ══════════════════════════════════════════════════════════════════════════════
+Outputs:
+
+  IPPublicaServidor:
+    Description: IP pública fija del servidor web (Elastic IP)
+    Value: !Ref ElasticIP
+    Export:
+      Name: !Sub "${NombreProyecto}-ip-publica"
+
+  InstanceId:
+    Description: ID de la instancia EC2 creada
+    Value: !Ref InstanciaWebServer
+    Export:
+      Name: !Sub "${NombreProyecto}-instance-id"
+
+  NombreBucketArtefactos:
+    Description: Nombre del bucket S3 de artefactos
+    Value: !Ref BucketArtefactos
+    Export:
+      Name: !Sub "${NombreProyecto}-bucket-artefactos"
+
+  NombreBucketLogs:
+    Description: Nombre del bucket S3 de logs
+    Value: !Ref BucketLogs
+    Export:
+      Name: !Sub "${NombreProyecto}-bucket-logs"
+
+  ComandoSSH:
+    Description: Comando para conectarse a la instancia via SSH
+    Value: !Sub "ssh -i vockey.pem ubuntu@${ElasticIP}"
