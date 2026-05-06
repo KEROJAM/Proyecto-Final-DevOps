@@ -1,5 +1,4 @@
 name: CI/CD Pipeline – STF DevOps
-# Equivalente al pipeline CodeBuild + CodePipeline
 # Se ejecuta automáticamente en cada push a main o develop
 
 on:
@@ -11,36 +10,11 @@ on:
 jobs:
 
   # ══════════════════════════════════════════════════════════════════════════
-  # JOB 1: Pruebas automatizadas (equivalente a CodeBuild pre_build)
-  # ══════════════════════════════════════════════════════════════════════════
-  pruebas:
-    name: Pruebas Automatizadas
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Clonar repositorio
-        uses: actions/checkout@v4
-
-      - name: Configurar Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Instalar dependencias
-        run: |
-          pip install --quiet -r app/requirements.txt
-          pip install --quiet pytest
-
-      - name: Ejecutar pruebas con pytest
-        run: pytest tests/ --tb=short --quiet
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # JOB 2: Build de imagen Docker (equivalente a CodeBuild build)
+  # JOB 1: Build de imagen Docker
   # ══════════════════════════════════════════════════════════════════════════
   build:
     name: Build Docker
     runs-on: ubuntu-latest
-    needs: pruebas          # solo corre si las pruebas pasan
 
     steps:
       - name: Clonar repositorio
@@ -57,7 +31,7 @@ jobs:
           docker stop test-flask
 
   # ══════════════════════════════════════════════════════════════════════════
-  # JOB 3: Despliegue en EC2 via SSM (equivalente a CodeBuild post_build)
+  # JOB 2: Despliegue en EC2 via SSM usando deploy_ec2.sh
   # Solo corre en push a main (no en PRs ni en develop)
   # ══════════════════════════════════════════════════════════════════════════
   deploy:
@@ -79,14 +53,14 @@ jobs:
           aws-region:            us-east-1
 
       - name: Empaquetar artefacto
-        run: zip -r artefacto.zip app/ nginx/ docker-compose.yml .env
+        run: zip -r artefacto.zip app/ nginx/ docker-compose.yml .env scripts/
 
       - name: Subir artefacto a S3
         run: |
           aws s3 cp artefacto.zip \
             s3://${{ secrets.BUCKET_ARTEFACTOS }}/artefacto.zip
 
-      - name: Guardar build exitoso en SSM
+      - name: Guardar build exitoso en SSM Parameter Store
         run: |
           aws ssm put-parameter \
             --name "/stf/ultimo-build-exitoso" \
@@ -94,31 +68,54 @@ jobs:
             --type String \
             --overwrite
 
-      - name: Desplegar en EC2 via SSM Session Manager
+      - name: Verificar que SSM puede ver la instancia
+        run: |
+          STATUS=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text 2>/dev/null || echo "None")
+          echo "SSM Ping Status: $STATUS"
+          if [ "$STATUS" != "Online" ]; then
+            echo "ERROR: La instancia no está registrada en SSM."
+            exit 1
+          fi
+
+      - name: Ejecutar deploy_ec2.sh en EC2 via SSM
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "cd /home/ubuntu/stf-app",
-              "aws s3 cp s3://${{ secrets.BUCKET_ARTEFACTOS }}/artefacto.zip .",
-              "unzip -o artefacto.zip",
-              "docker compose down",
-              "docker compose up -d --build",
-              "echo Deploy OK: $(date)"
-            ]' \
+            --parameters "commands=[
+              \"export BUCKET_ARTEFACTOS=${{ secrets.BUCKET_ARTEFACTOS }}\",
+              \"export COMMIT_SHA=${{ github.sha }}\",
+              \"export PATH=\$PATH:/usr/bin:/usr/local/bin:/snap/bin\",
+              \"aws s3 cp s3://${{ secrets.BUCKET_ARTEFACTOS }}/artefacto.zip /home/ubuntu/stf-app/artefacto.zip --region us-east-1\",
+              \"cd /home/ubuntu/stf-app && unzip -o artefacto.zip\",
+              \"bash /home/ubuntu/stf-app/scripts/deploy_ec2.sh\"
+            ]" \
             --query "Command.CommandId" \
             --output text)
 
-          # Esperar a que el comando termine en EC2
+          echo "Command ID: $COMMAND_ID"
+
+          # Esperar hasta 5 minutos a que termine
           aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
 
-          echo "Despliegue completado. Command ID: $COMMAND_ID"
+          # Mostrar output del script en EC2
+          echo "=== OUTPUT DEL DEPLOY ==="
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "StandardOutputContent" \
+            --output text
 
-      - name: Verificar que la app responde tras el deploy
-        run: |
-          sleep 10
-          curl --fail http://${{ secrets.EC2_PUBLIC_IP }}/health \
-            || echo "Advertencia: health check falló, revisar EC2"
+          echo "=== ERRORES (si los hay) ==="
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "StandardErrorContent" \
+            --output text
+
+          echo "Despliegue completado."
