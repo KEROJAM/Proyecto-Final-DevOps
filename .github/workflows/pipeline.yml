@@ -8,9 +8,14 @@ on:
     branches: [main]
 
 jobs:
+<<<<<<< HEAD
 
   # ══════════════════════════════════════════════════════════════════════════
   # JOB 1: Build de imagen Docker
+=======
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 2: Build de imagen Docker (equivalente a CodeBuild build)
+>>>>>>> bd3fd1f36b13ea24f87503c7564ff826ceeff924
   # ══════════════════════════════════════════════════════════════════════════
   build:
     name: Build Docker
@@ -103,6 +108,7 @@ jobs:
             --command-id "$COMMAND_ID" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
 
+<<<<<<< HEAD
           # Mostrar output del script en EC2
           echo "=== OUTPUT DEL DEPLOY ==="
           aws ssm get-command-invocation \
@@ -119,3 +125,6 @@ jobs:
             --output text
 
           echo "Despliegue completado."
+=======
+          echo "Despliegue completado. Command ID: $COMMAND_ID"
+>>>>>>> bd3fd1f36b13ea24f87503c7564ff826ceeff924
