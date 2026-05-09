@@ -142,30 +142,44 @@ def actualizar_precio(producto_id: str, nuevo_precio: float) -> bool:
 def actualizar_stock(producto_id: str, cantidad: int) -> bool:
     """
     Incrementa o decrementa el stock de un producto.
-    Usa una expresión atómica para evitar condiciones de carrera.
     Cantidad positiva = agregar stock / negativa = reducir stock.
+
+    Nota: DynamoDB no permite aritmética en ConditionExpression (stock + :c >= 0).
+    La validación de stock negativo se hace leyendo el valor actual primero,
+    y la actualización usa ADD que es atómica para evitar condiciones de carrera.
     """
     try:
+        # Paso 1: leer el stock actual para validar que no quede negativo
+        if cantidad < 0:
+            item = obtener_producto(producto_id)
+            if item is None:
+                print(f"[DynamoDB] El producto '{producto_id}' no existe.")
+                return False
+            stock_actual = int(item.get("stock", 0))
+            if stock_actual + cantidad < 0:
+                print(f"[DynamoDB] No se puede reducir: stock actual={stock_actual}, "
+                      f"reducción={abs(cantidad)}. El stock quedaría negativo.")
+                return False
+
+        # Paso 2: actualizar con ADD (operación atómica de DynamoDB)
+        # ADD suma el valor directamente sin necesidad de leer antes
         resp = tabla.update_item(
             Key={"producto_id": producto_id},
-            UpdateExpression="SET stock = stock + :c, actualizado_en = :t",
+            UpdateExpression="ADD stock :c SET actualizado_en = :t",
             ExpressionAttributeValues={
                 ":c": cantidad,
                 ":t": datetime.now(timezone.utc).isoformat(),
-                ":cero": 0,
             },
-            # Evitar que el stock quede negativo
-            ConditionExpression="attribute_exists(producto_id) AND stock + :c >= :cero",
+            ConditionExpression="attribute_exists(producto_id)",
             ReturnValues="UPDATED_NEW",
         )
-        nuevo_stock = resp["Attributes"]["stock"]
+        nuevo_stock = int(resp["Attributes"]["stock"])
         accion      = "agregadas" if cantidad > 0 else "reducidas"
         print(f"[DynamoDB] Stock de '{producto_id}' actualizado. "
               f"{abs(cantidad)} unidades {accion}. Nuevo stock: {nuevo_stock}")
         return True
     except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-        print(f"[DynamoDB] No se pudo actualizar: producto no existe "
-              f"o el stock quedaría negativo.")
+        print(f"[DynamoDB] El producto '{producto_id}' no existe.")
         return False
     except Exception as e:
         print(f"[DynamoDB] Error al actualizar stock: {e}")
