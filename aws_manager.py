@@ -6,6 +6,7 @@ Soluciones Tecnológicas del Futuro
 Funciones:
   - Aprovisionar instancias EC2 (máx. 9 en total, límite Learner Lab)
   - Listar buckets S3 y sus objetos
+  - Subir archivos a buckets S3
   - Generar reporte de uso de recursos en CSV
   - Obtener métricas de CloudWatch para instancias EC2
   - Gestionar reglas de Auto Scaling en EC2
@@ -201,6 +202,29 @@ def crear_bucket(nombre: str) -> bool:
         return True
     except Exception as e:
         print(f"[S3] Error al crear bucket: {e}")
+        return False
+
+
+def subir_archivo(bucket: str, ruta_local: str, clave_s3: str = None) -> bool:
+    """
+    Sube un archivo local a un bucket S3.
+
+    Si no se proporciona clave_s3, se usa el nombre del archivo local.
+    """
+    import os
+
+    clave_s3 = clave_s3 or os.path.basename(ruta_local)
+
+    if not os.path.isfile(ruta_local):
+        print(f"[S3] El archivo '{ruta_local}' no existe.")
+        return False
+
+    try:
+        s3.upload_file(ruta_local, bucket, clave_s3)
+        print(f"[S3] Archivo subido: '{ruta_local}' → s3://{bucket}/{clave_s3}")
+        return True
+    except Exception as e:
+        print(f"[S3] Error al subir archivo: {e}")
         return False
 
 
@@ -589,6 +613,11 @@ def menu(config: dict):
               lambda: print(json.dumps(
                   listar_objetos(input("  Nombre del bucket: ")),
                   indent=2, default=str))),
+        "E": ("Subir archivo a un bucket S3",
+              lambda: subir_archivo(
+                  input("  Nombre del bucket: "),
+                  input("  Ruta del archivo local: "),
+                  input("  Clave S3 (Enter para usar el nombre del archivo): ").strip() or None)),
         # ── REPORTES ─────────────────────────────────────────────────────────
         "7": ("Generar reporte CSV de recursos (EC2 + S3)",
               lambda: generar_reporte()),
@@ -631,7 +660,7 @@ def menu(config: dict):
         for k in ["1","2","3","4"]:
             print(f"  [{k}] {opciones[k][0]}")
         print("  ── S3 ──────────────────────────────────────────")
-        for k in ["5","6"]:
+        for k in ["5","6","E"]:
             print(f"  [{k}] {opciones[k][0]}")
         print("  ── REPORTES ────────────────────────────────────")
         for k in ["7"]:
